@@ -410,6 +410,104 @@ function matchLine(line,cands){
 }
 function counts(o){var c={ok:0,check:0,missing:0};(o.fields||[]).forEach(function(r){c[r.conf]=(c[r.conf]||0)+1;});return c;}
 
+/* ---------- bulk import (CSV / Excel) ---------- */
+var HCOLS=[
+ {key:'title',kw:['opportunity','title','name','opportunity name']},
+ {key:'deadline',kw:['deadline','due date','due','closing date']},
+ {key:'url',kw:['link','url','website','opportunity link']},
+ {key:'eligibility',kw:['eligibility','eligibility notes','requirements']},
+ {key:'notes',kw:['notes','note','comments']}
+];
+function mapHeaders(row){
+  var map={};
+  row.forEach(function(h,i){var n=normLabel(h);HCOLS.forEach(function(c){if(map[c.key]==null&&c.kw.indexOf(n)>-1)map[c.key]=i;});});
+  return map;
+}
+function pad2(n){return String(n).padStart(2,'0');}
+function parseDeadline(raw){
+  if(raw instanceof Date){if(isNaN(raw))return '';if(raw.getHours()===0&&raw.getMinutes()===0)raw.setHours(23,59);return raw.getFullYear()+'-'+pad2(raw.getMonth()+1)+'-'+pad2(raw.getDate())+'T'+pad2(raw.getHours())+':'+pad2(raw.getMinutes());}
+  var s=String(raw==null?'':raw).trim();if(!s)return '';
+  var m=/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(s);if(m)return m[1]+'-'+m[2]+'-'+m[3]+'T'+m[4]+':'+m[5];
+  m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(s);if(m)return m[1]+'-'+m[2]+'-'+m[3]+'T23:59';
+  m=/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})$/.exec(s);
+  if(m){var a=+m[1],b=+m[2],day,mon;if(a>12)(day=a,mon=b);else if(b>12)(day=b,mon=a);else(day=a,mon=b);return m[3]+'-'+pad2(mon)+'-'+pad2(day)+'T23:59';}
+  return '';
+}
+function parseCsv(text){
+  var rows=[],row=[],field='',inQ=false;
+  for(var i=0;i<text.length;i++){var c=text[i];
+    if(inQ){if(c==='"'){if(text[i+1]==='"'){field+='"';i++;}else inQ=false;}else field+=c;}
+    else{if(c==='"')inQ=true;else if(c===','){row.push(field);field='';}else if(c==='\r'){/*skip*/}else if(c==='\n'){row.push(field);rows.push(row);row=[];field='';}else field+=c;}
+  }
+  if(field.length||row.length){row.push(field);rows.push(row);}
+  return rows.filter(function(r){return r.length>1||(r[0]||'').trim()!=='';});
+}
+function importRows(rows){
+  if(!rows||!rows.length)return {added:0,skipped:0,noTitle:0};
+  var header=(rows[0]||[]).map(function(v){return v==null?'':String(v);});
+  var map=mapHeaders(header),hasHeader=Object.keys(map).length>0;
+  var dataRows=hasHeader?rows.slice(1):rows;
+  var order=hasHeader?map:{title:0,deadline:1,url:2,eligibility:3,notes:4};
+  var existing={};S.opps.forEach(function(o){existing[(o.title||'').trim().toLowerCase()]=true;});
+  var added=0,skipped=0,noTitle=0;
+  dataRows.forEach(function(r){
+    if(!r||!r.length)return;
+    function get(k){var idx=order[k];return idx==null||r[idx]==null?'':r[idx];}
+    var title=String(get('title')||'').trim();
+    if(!title){noTitle++;return;}
+    var key=title.toLowerCase();
+    if(existing[key]){skipped++;return;}
+    S.opps.push({id:uid(),title:title,url:String(get('url')||'').trim(),deadline:parseDeadline(get('deadline')),eligibility:String(get('eligibility')||'').trim(),notes:String(get('notes')||'').trim(),status:'Found',created:new Date().toISOString(),fields:[],questions:''});
+    existing[key]=true;added++;
+  });
+  if(added)persist();
+  return {added:added,skipped:skipped,noTitle:noTitle};
+}
+var xlsxPromise=null;
+function loadXLSX(){
+  if(window.XLSX)return Promise.resolve(window.XLSX);
+  if(xlsxPromise)return xlsxPromise;
+  xlsxPromise=new Promise(function(res,rej){
+    var s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload=function(){res(window.XLSX);};s.onerror=function(){xlsxPromise=null;rej(new Error('load failed'));};
+    document.head.appendChild(s);
+  });
+  return xlsxPromise;
+}
+function finishImport(rows){
+  var r=importRows(rows),msg;
+  msg=r.added?('Added '+r.added+' opportunit'+(r.added===1?'y':'ies')+'.'):'Nothing new to add.';
+  if(r.skipped)msg+=' '+r.skipped+' already on your board.';
+  if(r.noTitle)msg+=' '+r.noTitle+' row'+(r.noTitle===1?'':'s')+' had no name, skipped.';
+  toast(msg,r.added?IMG.thumbs:undefined);
+  if(r.added){tab='board';boardFilter='active';}
+  render();
+}
+function handleImportFile(file){
+  var name=(file.name||'').toLowerCase();
+  if(/\.csv$/.test(name)||file.type==='text/csv'){
+    var fr=new FileReader();
+    fr.onload=function(){var t=String(fr.result);if(t.charCodeAt(0)===0xFEFF)t=t.slice(1);finishImport(parseCsv(t));};
+    fr.onerror=function(){toast('Could not read that file.');};
+    fr.readAsText(file);
+  }else if(/\.(xlsx|xls)$/.test(name)){
+    toast('Reading the Excel file...');
+    var fr2=new FileReader();
+    fr2.onload=function(){
+      loadXLSX().then(function(XLSX){
+        try{
+          var wb=XLSX.read(new Uint8Array(fr2.result),{type:'array',cellDates:true});
+          var ws=wb.Sheets[wb.SheetNames[0]];
+          finishImport(XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:''}));
+        }catch(e){toast('Could not read that Excel file.');}
+      },function(){toast('Could not load the Excel reader. Check your connection, or save the file as CSV instead.');});
+    };
+    fr2.onerror=function(){toast('Could not read that file.');};
+    fr2.readAsArrayBuffer(file);
+  }else toast('Use a .csv or .xlsx file.');
+}
+
 /* ---------- state ---------- */
 var tab='board',boardFilter='active',sheetId=null,confirmDel=false,confirmReset=false,installEvt=null,lastDraft=null,moreTab='chat',repFilter='submitted';
 var prep={oppId:null,text:'',rows:[],queue:false,visited:{}};
@@ -448,7 +546,7 @@ function updateMascot(){
 }
 function boardView(){
   if(!S.opps.length){
-    return '<div class="card empty"><img class="big" src="'+IMG.logo+'" alt="Kumbidi"><img class="nil nil-b blink" src="'+IMG.nil+'" alt="AniyaNil!"><h2>Start here</h2><p class="muted" style="margin:4px 0">Kumbidi works in three steps.</p><ol class="steps" style="text-align:left;max-width:360px;margin:12px auto"><li>Fill in the <b>Vault</b> once with your details.</li><li>Add an opportunity below with its link and deadline.</li><li>In <b>Prepare</b>, paste the form questions and Kumbidi fills what it can.</li></ol><div class="btnrow" style="justify-content:center"><button class="btn primary" data-act="addOpp">Add opportunity</button><button class="btn" data-act="tab" data-tab="vault">Open vault</button></div></div>';
+    return '<div class="card empty"><img class="big" src="'+IMG.logo+'" alt="Kumbidi"><img class="nil nil-b blink" src="'+IMG.nil+'" alt="AniyaNil!"><h2>Start here</h2><p class="muted" style="margin:4px 0">Kumbidi works in three steps.</p><ol class="steps" style="text-align:left;max-width:360px;margin:12px auto"><li>Fill in the <b>Vault</b> once with your details.</li><li>Add an opportunity below with its link and deadline.</li><li>In <b>Prepare</b>, paste the form questions and Kumbidi fills what it can.</li></ol><div class="btnrow" style="justify-content:center"><button class="btn primary" data-act="addOpp">Add opportunity</button><button class="btn" data-act="tab" data-tab="tools">Import many at once</button></div></div>';
   }
   var act=activeOpps(),over=act.filter(function(o){return countdown(o.deadline).cls==='late';}).length;
   var week=act.filter(function(o){var c=countdown(o.deadline);return c.ms>=0&&c.ms<7*864e5;}).length;
@@ -468,7 +566,7 @@ function boardView(){
     return '<button class="note '+(c?c.cls:'done')+'" data-act="openOpp" data-id="'+o.id+'"><span class="cd"><b>'+esc(big)+'</b><i>'+esc(subt)+'</i></span><span class="ttl">'+esc(o.title||'Untitled')+'<small>'+(o.deadline?'Deadline '+esc(fmtDate(o.deadline)):'No deadline')+'</small><em class="pill s'+sIdx(o)+'">'+esc(o.status)+'</em>'+(o.queued&&sIdx(o)<3?' <em class="pill q">In queue</em>':'')+'</span></button>';
   }).join('')||'<div style="padding:18px 4px;color:#FFF7E3;font-weight:800">Nothing pinned here yet.</div>';
   return '<p class="muted" style="margin:0 0 4px">'+week+' due in the next 7 days, '+over+' overdue, '+sub+' submitted.</p>'+
-   '<div class="chips" role="group" aria-label="Filter">'+[['active','Active'],['sent','Submitted'],['all','All']].map(function(f){return '<button class="chip" data-act="filter" data-f="'+f[0]+'" aria-pressed="'+(boardFilter===f[0])+'">'+f[1]+'</button>';}).join('')+'<button class="btn primary sm" style="margin-left:auto" data-act="addOpp">Add opportunity</button></div>'+
+   '<div class="chips" role="group" aria-label="Filter">'+[['active','Active'],['sent','Submitted'],['all','All']].map(function(f){return '<button class="chip" data-act="filter" data-f="'+f[0]+'" aria-pressed="'+(boardFilter===f[0])+'">'+f[1]+'</button>';}).join('')+'<button class="btn sm" data-act="tab" data-tab="tools">Import</button><button class="btn primary sm" data-act="addOpp">Add opportunity</button></div>'+
    '<section class="desk" aria-label="Opportunities"><span class="label">Sorted by deadline</span>'+notes+'</section>';
 }
 function vaultView(){
@@ -534,6 +632,11 @@ function toolsView(){
   return moreSwitch()+'<h2>Tools</h2>'+
   '<div class="card"><h3 style="margin-top:0">Put Kumbidi on your Home Screen</h3><p class="muted small" style="margin-top:0"><b>iPhone:</b> open in Safari, tap Share, then Add to Home Screen.<br><b>Android:</b> open in Chrome, tap the menu, then Install app or Add to Home screen.</p>'+
    (installEvt?'<div class="btnrow"><button class="btn primary" data-act="install">Install Kumbidi</button></div>':'')+'</div>'+
+  '<div class="card"><h3 style="margin-top:0">Import opportunities</h3><p class="muted small" style="margin-top:0">Add many at once from a spreadsheet, shared to you or exported from Excel. Columns, any order, extras ignored: Opportunity, Deadline, Link, Eligibility notes, Notes.</p>'+
+   '<div class="btnrow"><button class="btn sm" data-act="importTemplate">Download a template</button></div>'+
+   '<label class="fld"><span>Choose a .csv or .xlsx file</span><input type="file" accept=".csv,.xlsx,.xls,text/csv" data-file="importOpps"></label>'+
+   '<p class="small muted">Matching by name skips anything already on your board. CSV always works; an .xlsx file needs an internet connection the first time.</p></div>'+
+
   '<div class="card"><h3 style="margin-top:0">Username and password</h3><p class="muted small">Passwords are made on this device and are never saved by Kumbidi. Copy the password into your password manager straight away.</p>'+
    '<label class="fld"><span>Length: <b>'+tools.len+'</b></span><input type="range" min="12" max="40" value="'+tools.len+'" data-tool="len" style="width:100%"></label>'+
    '<label style="display:flex;gap:10px;align-items:center;margin:8px 0"><input type="checkbox" class="big" data-tool="sym" '+(tools.sym?'checked':'')+'> Include symbols (some sites reject them)</label>'+
@@ -912,6 +1015,7 @@ function act(name,el){
       var b=JSON.stringify({kumbidi:'backup',version:1,exportedAt:new Date().toISOString(),data:S},null,2);
       saveFile('kumbidi-backup-'+new Date().toISOString().slice(0,10)+'.json',b).then(function(ok){if(ok)toast('Backup ready.');else{tools.exportText=b;render();}});break;}
     case 'restorePaste':doRestore(tools.paste||'');break;
+    case 'importTemplate':{var tpl='\ufeff'+'Opportunity,Deadline,Link,Eligibility notes,Notes\r\nExample Startup Grant,2026-12-31,https://example.com,Estonian companies only,Apply before the portal closes\r\n';saveFile('kumbidi-opportunities-template.csv',tpl).then(function(ok){toast(ok?'Template ready.':'Could not save the template here.');});break;}
     case 'install':if(installEvt){installEvt.prompt();installEvt.userChoice.then(function(){installEvt=null;render();});}break;
     case 'reset':if(!confirmReset){confirmReset=true;render();return;}S=blank();persist();confirmReset=false;prep={oppId:null,text:'',rows:[]};render();toast('Everything erased.');break;
     case 'resetCancel':confirmReset=false;render();break;
@@ -948,6 +1052,7 @@ document.addEventListener('change',function(e){
   }
   if(t.dataset.tool==='sym'){tools.sym=t.checked;return;}
   if(t.dataset.tool==='bank'){tools.includeBank=t.checked;return;}
+  if(t.dataset.file==='importOpps'){var fi=t.files&&t.files[0];if(fi)handleImportFile(fi);return;}
   if(t.dataset.file==='proof'){
     var f=t.files&&t.files[0];if(!f)return;
     toast('Saving screenshot...');
